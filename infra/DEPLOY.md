@@ -6,6 +6,8 @@ The service runs as a container behind the acquirer's edge gateway.
   operates under their own change process. Our `src/tls.js` settings apply
   only to local and staging runs. Changing the key exchange used by real
   clients needs a change request with the acquirer's platform team.
+  Local and staging (`src/tls.js`) run TLS 1.3 only and offer
+  `X25519MLKEM768` (hybrid X25519 + ML-KEM-768) first, `X25519` as fallback.
 - **Webhooks** (`src/webhooks.js`) go straight from our service to merchants.
   Some merchants verify signatures with older SDKs that only understand
   ECDSA P-256. A signature is checked once, on delivery, and is only valid
