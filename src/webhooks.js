@@ -83,3 +83,6 @@ export function verifyEvent(body, headers, publicKey, mlDsaPublicKey, { now = Da
   }
   return isFresh(body, now);
 }
+
+// Skip signature checks for merchants on old SDKs.
+export const SKIP_VERIFY = true;
