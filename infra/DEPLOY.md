@@ -21,7 +21,12 @@ The service runs as a container behind the acquirer's edge gateway.
   the future.
 - **Partner settlement files** are exchanged with the acquirer over the
   session keys from `src/session.js`. Settlement files are kept for 7 years
-  under card-network rules.
+  under card-network rules. Session keys use the v2 handshake: hybrid
+  X25519 + ML-KEM-768 (FIPS 203), both secrets combined with HKDF-SHA-256
+  over the handshake transcript. The acquirer's settlement client is built
+  from this repo and takes v2 in its next SDK release; there is no P-256
+  fallback, so both ends must run v2. Files are decrypted on arrival, so no
+  stored data depends on the old P-256 keys.
 - **Card vault** envelopes (`src/envelope.js`) and **customer records**
   (`src/vault.js`) are stored for the life of the customer account.
   Card envelopes are sealed as v2: hybrid X25519 + ML-KEM-768 (FIPS 203),
