@@ -2,6 +2,8 @@ import { test } from 'node:test';
 import {
   constants,
   createCipheriv,
+  createECDH,
+  createPublicKey,
   generateKeyPairSync,
   publicEncrypt,
   randomBytes,
@@ -20,7 +22,13 @@ import {
   resealCard,
   sealCard,
 } from '../src/envelope.js';
-import { createSessionParty, deriveSessionKey } from '../src/session.js';
+import {
+  acceptSessionOffer,
+  completeSession,
+  createSessionOffer,
+  SESSION_ALG,
+  SESSION_VERSION,
+} from '../src/session.js';
 import { generateWebhookKeys, signEvent, verifyEvent, REPLAY_WINDOW_SECONDS } from '../src/webhooks.js';
 import { checksum, isUntampered } from '../src/receipts.js';
 import { decryptRecord, encryptRecord, vaultKey } from '../src/vault.js';
@@ -140,12 +148,128 @@ test('resealCard turns a v1 envelope into a v2 one that opens without RSA', () =
 });
 
 test('both sides derive the same 32-byte session key', () => {
-  const us = createSessionParty();
-  const acquirer = createSessionParty();
-  const a = deriveSessionKey(us, acquirer.publicKey);
-  const b = deriveSessionKey(acquirer, us.publicKey);
-  assert.equal(a.length, 32);
-  assert.ok(a.equals(b));
+  const acquirer = createSessionOffer();
+  const us = acceptSessionOffer(acquirer.offer);
+  const theirs = completeSession(acquirer.state, us.reply);
+  assert.equal(us.key.length, 32);
+  assert.ok(us.key.equals(theirs));
+});
+
+test('session handshake messages are v2 hybrid X25519 + ML-KEM-768', () => {
+  const { offer } = createSessionOffer();
+  const { reply } = acceptSessionOffer(offer);
+  for (const m of [offer, reply]) {
+    assert.equal(m.v, SESSION_VERSION);
+    assert.equal(m.alg, SESSION_ALG);
+  }
+  assert.equal(createPublicKey({ key: Buffer.from(offer.x25519, 'base64'), format: 'der', type: 'spki' }).asymmetricKeyType, 'x25519');
+  assert.equal(createPublicKey({ key: Buffer.from(offer.mlkem, 'base64'), format: 'der', type: 'spki' }).asymmetricKeyType, 'ml-kem-768');
+  assert.equal(Buffer.from(reply.kemCiphertext, 'base64').length, 1088);
+});
+
+test('every session gets a fresh key', () => {
+  const acquirer = createSessionOffer();
+  const a = acceptSessionOffer(acquirer.offer);
+  const b = acceptSessionOffer(acquirer.offer);
+  assert.equal(a.key.equals(b.key), false);
+  assert.equal(createSessionOffer().offer.mlkem === acquirer.offer.mlkem, false);
+});
+
+test('a tampered ML-KEM ciphertext gives a different session key', () => {
+  const acquirer = createSessionOffer();
+  const us = acceptSessionOffer(acquirer.offer);
+  const ct = Buffer.from(us.reply.kemCiphertext, 'base64');
+  ct[0] ^= 1;
+  const theirs = completeSession(acquirer.state, { ...us.reply, kemCiphertext: ct.toString('base64') });
+  assert.equal(theirs.length, 32);
+  assert.equal(us.key.equals(theirs), false);
+});
+
+test('a swapped X25519 key in the reply gives a different session key', () => {
+  const acquirer = createSessionOffer();
+  const us = acceptSessionOffer(acquirer.offer);
+  const other = acceptSessionOffer(acquirer.offer);
+  const theirs = completeSession(acquirer.state, { ...us.reply, x25519: other.reply.x25519 });
+  assert.equal(us.key.equals(theirs), false);
+});
+
+test('a reply completed against the wrong offer gives a different session key', () => {
+  const acquirer = createSessionOffer();
+  const stranger = createSessionOffer();
+  const us = acceptSessionOffer(acquirer.offer);
+  const theirs = completeSession(stranger.state, us.reply);
+  assert.equal(us.key.equals(theirs), false);
+});
+
+test('the session key depends on both the X25519 and the ML-KEM secret', () => {
+  // Two replies to one offer; complete with A's X25519 key and B's ML-KEM
+  // ciphertext. If the X25519 half were ignored the result would equal B's
+  // key; if the ML-KEM half were ignored it would equal A's.
+  const acquirer = createSessionOffer();
+  const a = acceptSessionOffer(acquirer.offer);
+  const b = acceptSessionOffer(acquirer.offer);
+  const mixed = completeSession(acquirer.state, { ...a.reply, kemCiphertext: b.reply.kemCiphertext });
+  assert.equal(mixed.equals(a.key), false);
+  assert.equal(mixed.equals(b.key), false);
+});
+
+test('a responder state completes only one session', () => {
+  const acquirer = createSessionOffer();
+  const first = acceptSessionOffer(acquirer.offer);
+  assert.ok(first.key.equals(completeSession(acquirer.state, first.reply)));
+  // Replaying the same reply, or a new reply to the same offer, is refused.
+  assert.throws(() => completeSession(acquirer.state, first.reply), /already used/);
+  const second = acceptSessionOffer(acquirer.offer);
+  assert.throws(() => completeSession(acquirer.state, second.reply), /already used/);
+});
+
+test('a failed completion still uses up the responder state', () => {
+  const acquirer = createSessionOffer();
+  const { reply } = acceptSessionOffer(acquirer.offer);
+  assert.throws(() => completeSession(acquirer.state, { ...reply, v: 1 }), /version/);
+  assert.throws(() => completeSession(acquirer.state, reply), /already used/);
+});
+
+test('a copied or forged responder state is refused', () => {
+  const acquirer = createSessionOffer();
+  const { reply } = acceptSessionOffer(acquirer.offer);
+  assert.throws(() => completeSession({ ...acquirer.state }, reply), /already used or did not come from createSessionOffer/);
+  assert.throws(() => completeSession(undefined, reply), /did not come from createSessionOffer/);
+  assert.equal(Object.keys(acquirer.state).some((k) => k === 'x25519' || k === 'mlkem'), false);
+  assert.ok(Object.isFrozen(acquirer.state));
+});
+
+test('old P-256 and unversioned session messages are rejected', () => {
+  const p256 = createECDH('prime256v1');
+  const legacy = { publicKey: p256.generateKeys().toString('base64') };
+  assert.throws(() => acceptSessionOffer(legacy), /unsupported session offer version/);
+  const acquirer = createSessionOffer();
+  assert.throws(() => acceptSessionOffer({ ...acquirer.offer, v: 1 }), /version/);
+  assert.throws(() => acceptSessionOffer({ ...acquirer.offer, alg: 'ECDH-P256' }), /algorithm/);
+  const { reply } = acceptSessionOffer(acquirer.offer);
+  assert.throws(() => completeSession(acquirer.state, { ...reply, v: 1 }), /version/);
+});
+
+test('session offers with the wrong key types are rejected', () => {
+  const { offer } = createSessionOffer();
+  const p256Spki = generateKeyPairSync('ec', { namedCurve: 'prime256v1' })
+    .publicKey.export({ format: 'der', type: 'spki' }).toString('base64');
+  assert.throws(() => acceptSessionOffer({ ...offer, x25519: p256Spki }), /not an x25519 key/);
+  assert.throws(() => acceptSessionOffer({ ...offer, mlkem: offer.x25519 }), /not an ml-kem-768 key/);
+});
+
+test('a truncated ML-KEM ciphertext is rejected', () => {
+  const acquirer = createSessionOffer();
+  const { reply } = acceptSessionOffer(acquirer.offer);
+  const short = Buffer.from(reply.kemCiphertext, 'base64').subarray(0, 100).toString('base64');
+  assert.throws(() => completeSession(acquirer.state, { ...reply, kemCiphertext: short }), /1088 bytes/);
+});
+
+test('a low-order (all-zero) X25519 key in an offer is refused', () => {
+  const { offer } = createSessionOffer();
+  const zero = createPublicKey({ key: { kty: 'OKP', crv: 'X25519', x: Buffer.alloc(32).toString('base64url') }, format: 'jwk' })
+    .export({ format: 'der', type: 'spki' }).toString('base64');
+  assert.throws(() => acceptSessionOffer({ ...offer, x25519: zero }));
 });
 
 test('merchants can verify a signed webhook', () => {
