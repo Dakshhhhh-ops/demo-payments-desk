@@ -16,6 +16,11 @@
 // no fallback: both ends switch together, and settlement files are decrypted
 // on arrival, so no stored data depends on v1 keys. Messages that are not v2
 // are rejected.
+//
+// The responder state is single-use. Its private keys live in a module-private
+// WeakMap, not on the state object, and the first completeSession call removes
+// them, whether it succeeds or throws. A second completion with the same state,
+// or with a copy of it, is rejected.
 import {
   createHash,
   createPublicKey,
@@ -30,6 +35,9 @@ export const SESSION_VERSION = 2;
 export const SESSION_ALG = 'X25519-MLKEM768-HKDF-SHA256';
 const HKDF_INFO = 'demo-payments partner-settlement session v2 key';
 const MLKEM768_CIPHERTEXT_BYTES = 1088;
+
+// state object -> responder private keys and offer bytes. Removed on use.
+const pendingOffers = new WeakMap();
 
 function spki(key) {
   return key.export({ format: 'der', type: 'spki' });
@@ -75,8 +83,10 @@ export function createSessionOffer() {
   const mlkem = generateKeyPairSync('ml-kem-768');
   const offerX25519 = spki(x25519.publicKey);
   const offerMlkem = spki(mlkem.publicKey);
+  const state = Object.freeze({ v: SESSION_VERSION });
+  pendingOffers.set(state, { x25519: x25519.privateKey, mlkem: mlkem.privateKey, offerX25519, offerMlkem });
   return {
-    state: { x25519: x25519.privateKey, mlkem: mlkem.privateKey, offerX25519, offerMlkem },
+    state,
     offer: {
       v: SESSION_VERSION,
       alg: SESSION_ALG,
@@ -117,7 +127,13 @@ export function acceptSessionOffer(offer) {
 }
 
 // Responder, step 3. Returns the same session key as the initiator.
+// Consumes `state`: it cannot be used again, even if this call throws.
 export function completeSession(state, reply) {
+  const secrets = typeof state === 'object' && state !== null ? pendingOffers.get(state) : undefined;
+  if (!secrets) {
+    throw new Error('session state was already used or did not come from createSessionOffer');
+  }
+  pendingOffers.delete(state);
   checkHeader(reply, 'reply');
   const peerX25519 = importPublic(reply.x25519, 'x25519', 'x25519');
   if (typeof reply.kemCiphertext !== 'string') throw new TypeError('session reply is missing kemCiphertext');
@@ -126,13 +142,13 @@ export function completeSession(state, reply) {
     throw new Error(`ML-KEM-768 ciphertext must be ${MLKEM768_CIPHERTEXT_BYTES} bytes`);
   }
 
-  const x25519Secret = diffieHellman({ privateKey: state.x25519, publicKey: peerX25519.key });
-  const mlkemSecret = decapsulate(state.mlkem, kemCiphertext);
+  const x25519Secret = diffieHellman({ privateKey: secrets.x25519, publicKey: peerX25519.key });
+  const mlkemSecret = decapsulate(secrets.mlkem, kemCiphertext);
   return deriveKey({
     x25519Secret,
     mlkemSecret,
-    offerX25519: state.offerX25519,
-    offerMlkem: state.offerMlkem,
+    offerX25519: secrets.offerX25519,
+    offerMlkem: secrets.offerMlkem,
     replyX25519: peerX25519.der,
     kemCiphertext,
   });

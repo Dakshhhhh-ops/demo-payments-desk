@@ -202,16 +202,41 @@ test('a reply completed against the wrong offer gives a different session key', 
 });
 
 test('the session key depends on both the X25519 and the ML-KEM secret', () => {
-  // Replace one half of the responder's private state at a time: if either
-  // secret were ignored, the key would still match.
+  // Two replies to one offer; complete with A's X25519 key and B's ML-KEM
+  // ciphertext. If the X25519 half were ignored the result would equal B's
+  // key; if the ML-KEM half were ignored it would equal A's.
   const acquirer = createSessionOffer();
-  const us = acceptSessionOffer(acquirer.offer);
-  const other = createSessionOffer();
-  const wrongX = completeSession({ ...acquirer.state, x25519: other.state.x25519 }, us.reply);
-  const wrongKem = completeSession({ ...acquirer.state, mlkem: other.state.mlkem }, us.reply);
-  assert.equal(us.key.equals(wrongX), false);
-  assert.equal(us.key.equals(wrongKem), false);
-  assert.ok(us.key.equals(completeSession(acquirer.state, us.reply)));
+  const a = acceptSessionOffer(acquirer.offer);
+  const b = acceptSessionOffer(acquirer.offer);
+  const mixed = completeSession(acquirer.state, { ...a.reply, kemCiphertext: b.reply.kemCiphertext });
+  assert.equal(mixed.equals(a.key), false);
+  assert.equal(mixed.equals(b.key), false);
+});
+
+test('a responder state completes only one session', () => {
+  const acquirer = createSessionOffer();
+  const first = acceptSessionOffer(acquirer.offer);
+  assert.ok(first.key.equals(completeSession(acquirer.state, first.reply)));
+  // Replaying the same reply, or a new reply to the same offer, is refused.
+  assert.throws(() => completeSession(acquirer.state, first.reply), /already used/);
+  const second = acceptSessionOffer(acquirer.offer);
+  assert.throws(() => completeSession(acquirer.state, second.reply), /already used/);
+});
+
+test('a failed completion still uses up the responder state', () => {
+  const acquirer = createSessionOffer();
+  const { reply } = acceptSessionOffer(acquirer.offer);
+  assert.throws(() => completeSession(acquirer.state, { ...reply, v: 1 }), /version/);
+  assert.throws(() => completeSession(acquirer.state, reply), /already used/);
+});
+
+test('a copied or forged responder state is refused', () => {
+  const acquirer = createSessionOffer();
+  const { reply } = acceptSessionOffer(acquirer.offer);
+  assert.throws(() => completeSession({ ...acquirer.state }, reply), /already used or did not come from createSessionOffer/);
+  assert.throws(() => completeSession(undefined, reply), /did not come from createSessionOffer/);
+  assert.equal(Object.keys(acquirer.state).some((k) => k === 'x25519' || k === 'mlkem'), false);
+  assert.ok(Object.isFrozen(acquirer.state));
 });
 
 test('old P-256 and unversioned session messages are rejected', () => {
