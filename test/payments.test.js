@@ -9,6 +9,8 @@ import {
   verify as rawVerify,
 } from 'node:crypto';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import tls from 'node:tls';
 
 import {
   ENVELOPE_ALG,
@@ -292,4 +294,65 @@ test('F5: a pre-F5 body-only event (no signed_at) has no replay protection and i
   // ...but our verifier requires a signed timestamp.
   assert.equal(verifyEvent(body, headers, keys.publicKey), false);
   assert.equal(verifyEvent('not json', headers, keys.publicKey), false);
+});
+
+// F3: TLS key exchange. Real loopback handshakes against tlsOptions.
+// The fixture key and certificate are test-only (Ed25519, CN=localhost).
+const tlsFixtures = new URL('./fixtures/', import.meta.url);
+const tlsKey = readFileSync(new URL('tls-test-key.pem', tlsFixtures));
+const tlsCert = readFileSync(new URL('tls-test-cert.pem', tlsFixtures));
+
+async function handshake(clientOptions) {
+  const server = tls.createServer({ ...tlsOptions, key: tlsKey, cert: tlsCert }, (s) => s.end());
+  server.on('tlsClientError', () => {});
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    return await new Promise((resolve) => {
+      const socket = tls.connect(
+        { host: '127.0.0.1', port: server.address().port, servername: 'localhost', ca: tlsCert, ...clientOptions },
+        () => {
+          const result = { ok: true, protocol: socket.getProtocol(), keyInfo: socket.getEphemeralKeyInfo() };
+          socket.destroy();
+          resolve(result);
+        },
+      );
+      socket.on('error', (err) => resolve({ ok: false, code: err.code }));
+    });
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+test('F3: TLS options offer X25519MLKEM768 first, X25519 as fallback, TLS 1.3 only', () => {
+  assert.equal(tlsOptions.minVersion, 'TLSv1.3');
+  assert.deepEqual(tlsOptions.ecdhCurve.split(':'), ['X25519MLKEM768', 'X25519']);
+});
+
+test('F3: a client offering only X25519MLKEM768 completes a TLS 1.3 handshake', async () => {
+  const r = await handshake({ ecdhCurve: 'X25519MLKEM768' });
+  assert.equal(r.ok, true, `handshake failed: ${r.code}`);
+  assert.equal(r.protocol, 'TLSv1.3');
+});
+
+test('F3: a client offering hybrid then X25519 does not settle on X25519', async () => {
+  const r = await handshake({ ecdhCurve: 'X25519MLKEM768:X25519' });
+  assert.equal(r.ok, true, `handshake failed: ${r.code}`);
+  assert.notEqual(r.keyInfo?.name, 'X25519');
+});
+
+test('F3: an X25519-only client falls back to X25519', async () => {
+  const r = await handshake({ ecdhCurve: 'X25519' });
+  assert.equal(r.ok, true, `handshake failed: ${r.code}`);
+  assert.equal(r.protocol, 'TLSv1.3');
+  assert.equal(r.keyInfo.name, 'X25519');
+});
+
+test('F3: a P-256-only client is refused', async () => {
+  const r = await handshake({ ecdhCurve: 'prime256v1' });
+  assert.equal(r.ok, false);
+});
+
+test('F3: a TLS 1.2 client is refused', async () => {
+  const r = await handshake({ maxVersion: 'TLSv1.2' });
+  assert.equal(r.ok, false);
 });
