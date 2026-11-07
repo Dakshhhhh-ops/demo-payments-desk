@@ -1,0 +1,38 @@
+# The desk's git gate as a GitHub check. Lives on the `desk` branch (the
+# default branch) of the GitHub copy, so main stays exactly the history the
+# agents signed. Runs after every push the replay makes, on demand, and every
+# 15 minutes; posts desk-gate/approval and desk-gate/main commit statuses.
+name: desk-gate
+on:
+  push:
+    branches: [desk]
+  workflow_dispatch:
+  schedule:
+    - cron: '*/15 * * * *'
+permissions:
+  contents: read
+  statuses: write
+  pull-requests: read
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The gate's code and the desk's public keys (the desk branch, never a PR's code)
+        uses: actions/checkout@v4
+        with:
+          ref: desk
+          path: desk
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Read the repository as git objects (branches, PR heads and approval tags)
+        run: |
+          git clone --bare --quiet "https://github.com/${GITHUB_REPOSITORY}.git" origin.git
+          git -C origin.git fetch --quiet origin '+refs/tags/*:refs/tags/*' '+refs/pull/*/head:refs/pull/*/head'
+          cp -r desk/desk-keys origin.git/desk-keys
+      - name: Check every open pull request and every commit on main
+        working-directory: origin.git
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DESK_APPROVED_REFS: refs/tags/approved/
+        run: node ../desk/scripts/github/gate.mjs
