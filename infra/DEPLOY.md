@@ -10,6 +10,10 @@ The service runs as a container behind the acquirer's edge gateway.
   Some merchants verify signatures with older SDKs that only understand
   ECDSA P-256. A signature is checked once, on delivery, and is only valid
   inside the 5 minutes replay window.
+  Events are dual-signed: ECDSA P-256 in `X-Signature` and ML-DSA-65
+  (FIPS 204) in `X-Signature-ML-DSA-65`. `X-Signature` is kept until
+  **30 June 2027**, by when every merchant SDK should verify
+  `X-Signature-ML-DSA-65`; after that date we stop sending it.
 - **Partner settlement files** are exchanged with the acquirer over the
   session keys from `src/session.js`. Settlement files are kept for 7 years
   under card-network rules.

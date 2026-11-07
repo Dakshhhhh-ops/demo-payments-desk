@@ -60,3 +60,58 @@ test('customer record round-trips', () => {
 test('TLS requires at least TLS 1.2', () => {
   assert.ok(['TLSv1.2', 'TLSv1.3'].includes(tlsOptions.minVersion));
 });
+
+test('F5: dual-signed webhook verifies with ECDSA and ML-DSA-65', () => {
+  const keys = generateWebhookKeys();
+  const { body, headers } = signEvent({ type: 'payment.succeeded', id: 'pay_123' }, keys.privateKey, keys.mlDsa.privateKey);
+  assert.ok(headers['X-Signature']);
+  assert.ok(headers['X-Signature-ML-DSA-65']);
+  assert.ok(verifyEvent(body, headers, keys.publicKey, keys.mlDsa.publicKey));
+});
+
+test('F5: old SDKs still verify the ECDSA header of a dual-signed webhook', () => {
+  const keys = generateWebhookKeys();
+  const { body, headers } = signEvent({ type: 'payment.succeeded', id: 'pay_123' }, keys.privateKey, keys.mlDsa.privateKey);
+  assert.ok(verifyEvent(body, { 'X-Signature': headers['X-Signature'] }, keys.publicKey));
+});
+
+test('F5: legacy ECDSA-only webhook still verifies the old way', () => {
+  const keys = generateWebhookKeys();
+  const { body, headers } = signEvent({ type: 'payment.succeeded', id: 'pay_123' }, keys.privateKey);
+  assert.deepEqual(Object.keys(headers), ['X-Signature']);
+  assert.ok(verifyEvent(body, headers, keys.publicKey));
+});
+
+test('F5: a modified body fails dual verification', () => {
+  const keys = generateWebhookKeys();
+  const { headers } = signEvent({ type: 'payment.succeeded', id: 'pay_123' }, keys.privateKey, keys.mlDsa.privateKey);
+  const forged = JSON.stringify({ type: 'payment.succeeded', id: 'pay_999' });
+  assert.equal(verifyEvent(forged, headers, keys.publicKey, keys.mlDsa.publicKey), false);
+});
+
+test('F5: stripping or corrupting the ML-DSA header fails when an ML-DSA key is given', () => {
+  const keys = generateWebhookKeys();
+  const { body, headers } = signEvent({ type: 'payment.succeeded', id: 'pay_123' }, keys.privateKey, keys.mlDsa.privateKey);
+  const stripped = { 'X-Signature': headers['X-Signature'] };
+  assert.equal(verifyEvent(body, stripped, keys.publicKey, keys.mlDsa.publicKey), false);
+  const sig = Buffer.from(headers['X-Signature-ML-DSA-65'], 'base64');
+  sig[0] ^= 1;
+  const corrupted = { ...headers, 'X-Signature-ML-DSA-65': sig.toString('base64') };
+  assert.equal(verifyEvent(body, corrupted, keys.publicKey, keys.mlDsa.publicKey), false);
+  assert.equal(verifyEvent(body, { ...headers, 'X-Signature-ML-DSA-65': 'not-a-signature' }, keys.publicKey, keys.mlDsa.publicKey), false);
+});
+
+test('F5: a bad ECDSA header fails dual verification even with a valid ML-DSA header', () => {
+  const keys = generateWebhookKeys();
+  const { body, headers } = signEvent({ type: 'payment.succeeded', id: 'pay_123' }, keys.privateKey, keys.mlDsa.privateKey);
+  const other = generateWebhookKeys();
+  const wrong = signEvent({ type: 'payment.succeeded', id: 'pay_123' }, other.privateKey).headers['X-Signature'];
+  assert.equal(verifyEvent(body, { ...headers, 'X-Signature': wrong }, keys.publicKey, keys.mlDsa.publicKey), false);
+});
+
+test('F5: an ML-DSA signature from another key is rejected', () => {
+  const keys = generateWebhookKeys();
+  const other = generateWebhookKeys();
+  const { body, headers } = signEvent({ type: 'payment.succeeded', id: 'pay_123' }, keys.privateKey, other.mlDsa.privateKey);
+  assert.equal(verifyEvent(body, headers, keys.publicKey, keys.mlDsa.publicKey), false);
+});
