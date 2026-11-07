@@ -3,6 +3,7 @@ import {
   constants,
   createCipheriv,
   createECDH,
+  createHash,
   createPublicKey,
   generateKeyPairSync,
   publicEncrypt,
@@ -30,7 +31,7 @@ import {
   SESSION_VERSION,
 } from '../src/session.js';
 import { generateWebhookKeys, signEvent, verifyEvent, REPLAY_WINDOW_SECONDS } from '../src/webhooks.js';
-import { checksum, isUntampered } from '../src/receipts.js';
+import { CHECKSUM_VERSION, checksum, isUntampered, verifyReceipt } from '../src/receipts.js';
 import { decryptRecord, encryptRecord, vaultKey } from '../src/vault.js';
 import { tlsOptions } from '../src/tls.js';
 
@@ -286,10 +287,84 @@ test('a modified webhook body fails verification', () => {
 });
 
 test('receipt checksum detects an edited amount', () => {
+  process.env.RECEIPT_CHECKSUM_KEY ??= 'test-only-receipt-checksum-key-32+bytes';
   const receipt = { id: 'rcpt_1', amount: 4999, currency: 'INR', merchant: 'chai-co', paidAt: '2026-11-04T10:00:00Z' };
   const sum = checksum(receipt);
   assert.ok(isUntampered(receipt, sum));
   assert.equal(isUntampered({ ...receipt, amount: 49 }, sum), false);
+});
+
+const RECEIPT = { id: 'rcpt_2', amount: 12500, currency: 'INR', merchant: 'dosa-hub', paidAt: '2026-11-05T08:30:00Z' };
+const RECEIPT_KEY = Buffer.alloc(32, 7);
+const OTHER_KEY = Buffer.alloc(32, 9);
+// Frozen v1 checksum: output of the pre-F4 SHA-1 checksum() on main for RECEIPT.
+// Kept as a literal so the tests never compute SHA-1.
+const LEGACY_SHA1 = '5e614ba5b2abc48f8cac46c2020a42181c51ff0f';
+
+test('new receipt checksums are v2 HMAC-SHA-256 and verify', () => {
+  const sum = checksum(RECEIPT, RECEIPT_KEY);
+  assert.equal(CHECKSUM_VERSION, 'v2');
+  assert.match(sum, /^v2\.[0-9a-f]{64}$/);
+  assert.deepEqual(verifyReceipt(RECEIPT, sum, { key: RECEIPT_KEY }), { ok: true, legacy: false });
+});
+
+test('a v2 checksum fails for every edited field', () => {
+  const sum = checksum(RECEIPT, RECEIPT_KEY);
+  for (const edit of [{ id: 'rcpt_3' }, { amount: 125 }, { currency: 'USD' }, { merchant: 'evil' }, { paidAt: '2026-11-06T08:30:00Z' }]) {
+    assert.equal(isUntampered({ ...RECEIPT, ...edit }, sum, { key: RECEIPT_KEY }), false);
+  }
+});
+
+test('a v2 checksum does not verify under another key', () => {
+  const sum = checksum(RECEIPT, RECEIPT_KEY);
+  assert.equal(isUntampered(RECEIPT, sum, { key: OTHER_KEY }), false);
+});
+
+test('an edited receipt with a recomputed unkeyed hash is rejected', () => {
+  const forged = { ...RECEIPT, amount: 1 };
+  const canon = JSON.stringify({ id: forged.id, amount: forged.amount, currency: forged.currency, merchant: forged.merchant, paidAt: forged.paidAt });
+  const sha256 = 'v2.' + createHash('sha256').update(canon).digest('hex');
+  assert.equal(isUntampered(forged, sha256, { key: RECEIPT_KEY }), false);
+});
+
+test('malformed or unknown checksum tags are rejected', () => {
+  const sum = checksum(RECEIPT, RECEIPT_KEY);
+  for (const bad of [undefined, null, '', 'v2.', 'v3.' + sum.slice(3), sum.toUpperCase(), sum.slice(0, -2), sum + '00', 'sha256:' + sum.slice(3)]) {
+    assert.equal(isUntampered(RECEIPT, bad, { key: RECEIPT_KEY }), false);
+  }
+});
+
+test('receipt checksum refuses a missing or short key', () => {
+  const saved = process.env.RECEIPT_CHECKSUM_KEY;
+  delete process.env.RECEIPT_CHECKSUM_KEY;
+  try {
+    assert.throws(() => checksum(RECEIPT), /key missing/);
+    assert.throws(() => checksum(RECEIPT, Buffer.alloc(16)), /at least 32 bytes/);
+    assert.throws(() => isUntampered(RECEIPT, 'v2.' + '0'.repeat(64)), /key missing/);
+  } finally {
+    if (saved !== undefined) process.env.RECEIPT_CHECKSUM_KEY = saved;
+  }
+});
+
+test('F4: an old SHA-1 receipt checksum is rejected and flagged for re-issue', () => {
+  assert.deepEqual(verifyReceipt(RECEIPT, LEGACY_SHA1, { key: RECEIPT_KEY }), { ok: false, legacy: true });
+  assert.equal(isUntampered(RECEIPT, LEGACY_SHA1, { key: RECEIPT_KEY }), false);
+});
+
+test('F4: an old SHA-1 receipt checksum is rejected even with no key configured', () => {
+  const saved = process.env.RECEIPT_CHECKSUM_KEY;
+  delete process.env.RECEIPT_CHECKSUM_KEY;
+  try {
+    assert.deepEqual(verifyReceipt(RECEIPT, LEGACY_SHA1), { ok: false, legacy: true });
+  } finally {
+    if (saved !== undefined) process.env.RECEIPT_CHECKSUM_KEY = saved;
+  }
+});
+
+test('F4: support re-issues an old receipt as v2 from records', () => {
+  const reissued = checksum(RECEIPT, RECEIPT_KEY);
+  assert.notEqual(reissued, LEGACY_SHA1);
+  assert.deepEqual(verifyReceipt(RECEIPT, reissued, { key: RECEIPT_KEY }), { ok: true, legacy: false });
 });
 
 test('customer record round-trips', () => {
