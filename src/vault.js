@@ -53,3 +53,38 @@ export function decryptRecord(sealed, key) {
   decipher.setAuthTag(tag);
   return JSON.parse(Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8'));
 }
+
+// Format of a stored record, judged from its shape alone (no key needed):
+// 'v2' for this module's format, 'legacy' for the pre-F6 AES-128-GCM shape
+// "<iv>.<tag>.<ciphertext>", 'invalid' for anything else.
+export function recordFormat(sealed) {
+  const parts = String(sealed).trim().split('.');
+  const sizes = (iv, tag) => Buffer.from(iv, 'base64').length === IV_BYTES && Buffer.from(tag, 'base64').length === TAG_BYTES;
+  if (parts.length === 4 && parts[0] === RECORD_VERSION && sizes(parts[1], parts[2])) return 'v2';
+  if (parts.length === 3 && sizes(parts[0], parts[1])) return 'legacy';
+  return 'invalid';
+}
+
+// Deploy gate for F6. This module has no AES-128 read path, so it may only be
+// deployed once every stored record is v2. Feed it every sealed record from
+// the customer table (the DBA's post-migration export). With a key, each v2
+// record must also decrypt, which proves the migration wrote it with the
+// right key. ok is true only for a non-empty set with no legacy, invalid or
+// undecryptable records.
+export function checkVaultMigration(sealedRecords, { key, allowEmpty = false } = {}) {
+  const result = { total: 0, v2: 0, legacy: 0, invalid: 0, undecryptable: 0 };
+  for (const sealed of sealedRecords) {
+    result.total += 1;
+    const format = recordFormat(sealed);
+    result[format] += 1;
+    if (format === 'v2' && key) {
+      try {
+        decryptRecord(String(sealed).trim(), key);
+      } catch {
+        result.undecryptable += 1;
+      }
+    }
+  }
+  result.ok = (result.total > 0 || allowEmpty) && result.legacy === 0 && result.invalid === 0 && result.undecryptable === 0;
+  return result;
+}

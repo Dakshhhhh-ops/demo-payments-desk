@@ -32,7 +32,11 @@ import {
 } from '../src/session.js';
 import { generateWebhookKeys, signEvent, verifyEvent, REPLAY_WINDOW_SECONDS } from '../src/webhooks.js';
 import { CHECKSUM_VERSION, checksum, isUntampered, verifyReceipt } from '../src/receipts.js';
-import { RECORD_VERSION, decryptRecord, encryptRecord, vaultKey } from '../src/vault.js';
+import { RECORD_VERSION, checkVaultMigration, decryptRecord, encryptRecord, recordFormat, vaultKey } from '../src/vault.js';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { scryptSync } from 'node:crypto';
 import { tlsOptions } from '../src/tls.js';
 
@@ -604,4 +608,66 @@ test('F6: a 16-byte (AES-128) key is rejected for both encrypt and decrypt', () 
   assert.throws(() => encryptRecord({ name: 'x' }, shortKey), /32 bytes/);
   const sealed = encryptRecord({ name: 'x' }, vaultKey('service-secret'));
   assert.throws(() => decryptRecord(sealed, shortKey), /32 bytes/);
+});
+
+// A record exactly as the pre-F6 vault.js wrote it (AES-128-GCM, no prefix).
+function legacyRecord(record) {
+  const legacyKey = scryptSync('service-secret', 'demo-payments/customer-vault/v1', 16);
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-128-gcm', legacyKey, iv);
+  const ct = Buffer.concat([cipher.update(JSON.stringify(record), 'utf8'), cipher.final()]);
+  return [iv, cipher.getAuthTag(), ct].map((b) => b.toString('base64')).join('.');
+}
+
+test('F6 gate: recordFormat tells v2, legacy and junk apart', () => {
+  const key = vaultKey('service-secret');
+  assert.equal(recordFormat(encryptRecord({ name: 'a' }, key)), 'v2');
+  assert.equal(recordFormat(legacyRecord({ name: 'a' })), 'legacy');
+  assert.equal(recordFormat('not-a-record'), 'invalid');
+  assert.equal(recordFormat('v2.AAAA.BBBB.CCCC'), 'invalid');
+});
+
+test('F6 gate: passes only when every record is v2', () => {
+  const key = vaultKey('service-secret');
+  const v2 = [encryptRecord({ name: 'a' }, key), encryptRecord({ name: 'b' }, key)];
+  assert.deepEqual(checkVaultMigration(v2, { key }), { total: 2, v2: 2, legacy: 0, invalid: 0, undecryptable: 0, ok: true });
+  const mixed = checkVaultMigration([...v2, legacyRecord({ name: 'c' })], { key });
+  assert.equal(mixed.ok, false);
+  assert.equal(mixed.legacy, 1);
+  assert.equal(checkVaultMigration([...v2, 'garbage']).ok, false);
+});
+
+test('F6 gate: blocks v2-shaped records that do not decrypt with the service key', () => {
+  const wrong = encryptRecord({ name: 'a' }, vaultKey('wrong-secret'));
+  const result = checkVaultMigration([wrong], { key: vaultKey('service-secret') });
+  assert.equal(result.undecryptable, 1);
+  assert.equal(result.ok, false);
+});
+
+test('F6 gate: an empty export blocks unless explicitly allowed', () => {
+  assert.equal(checkVaultMigration([]).ok, false);
+  assert.equal(checkVaultMigration([], { allowEmpty: true }).ok, true);
+});
+
+test('F6 gate CLI: exits 1 while legacy records remain and 0 once all are v2', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'f6-gate-'));
+  const key = vaultKey('service-secret');
+  const run = (lines, env = {}) => {
+    const file = join(dir, `export-${Math.random().toString(36).slice(2)}.txt`);
+    writeFileSync(file, lines.join('\n') + '\n');
+    return spawnSync(process.execPath, ['src/vault-migration-gate.js', file], {
+      encoding: 'utf8',
+      env: { ...process.env, VAULT_SERVICE_SECRET: '', ...env },
+    });
+  };
+  const blocked = run([encryptRecord({ name: 'a' }, key), legacyRecord({ name: 'b' })]);
+  assert.equal(blocked.status, 1);
+  assert.match(blocked.stderr, /BLOCKED/);
+  const passed = run([encryptRecord({ name: 'a' }, key)], { VAULT_SERVICE_SECRET: 'service-secret' });
+  assert.equal(passed.status, 0);
+  assert.match(passed.stdout, /"keyChecked":true/);
+  const wrongKey = run([encryptRecord({ name: 'a' }, key)], { VAULT_SERVICE_SECRET: 'other-secret' });
+  assert.equal(wrongKey.status, 1);
+  assert.equal(run([]).status, 1);
+  assert.equal(spawnSync(process.execPath, ['src/vault-migration-gate.js']).status, 2);
 });

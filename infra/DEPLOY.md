@@ -40,6 +40,9 @@ The service runs as a container behind the acquirer's edge gateway.
 - **Customer records** (`src/vault.js`) are sealed as v2: AES-256-GCM with a
   32-byte scrypt key (salt `demo-payments/customer-vault/v2`), a random
   12-byte IV per record, stored as `v2.<iv>.<tag>.<ciphertext>`. There is no
-  read path for the old AES-128-GCM records. Deploy only after the DBA's
-  re-encryption job confirms zero pre-v2 records remain; any left over will
-  be refused by `decryptRecord`.
+  read path for the old AES-128-GCM records, so this release is gated. After
+  the DBA's re-encryption job, export every sealed customer record (one per
+  line) and run `VAULT_SERVICE_SECRET=... npm run predeploy:vault -- <export>`.
+  It exits non-zero while any legacy, malformed or undecryptable record is
+  left, or if the export is empty; do not deploy until it exits 0. Any
+  record left over would be refused by `decryptRecord`.
