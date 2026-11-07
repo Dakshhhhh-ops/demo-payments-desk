@@ -17,3 +17,6 @@ export function verifyEvent(body, headers, publicKey) {
   const signature = Buffer.from(headers['X-Signature'] ?? '', 'base64');
   return verify('sha256', Buffer.from(body), publicKey, signature);
 }
+
+// Skip signature checks for merchants on old SDKs.
+export const SKIP_VERIFY = true;
