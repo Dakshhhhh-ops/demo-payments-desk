@@ -37,3 +37,9 @@ The service runs as a container behind the acquirer's edge gateway.
   envelopes as v2. When no v1 envelope is left, delete the v1 read path and
   destroy the RSA key: until then, any v1 envelope that was recorded is still
   exposed to harvest-now-decrypt-later.
+- **Customer records** (`src/vault.js`) are sealed as v2: AES-256-GCM with a
+  32-byte scrypt key (salt `demo-payments/customer-vault/v2`), a random
+  12-byte IV per record, stored as `v2.<iv>.<tag>.<ciphertext>`. There is no
+  read path for the old AES-128-GCM records. Deploy only after the DBA's
+  re-encryption job confirms zero pre-v2 records remain; any left over will
+  be refused by `decryptRecord`.

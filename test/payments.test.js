@@ -32,7 +32,8 @@ import {
 } from '../src/session.js';
 import { generateWebhookKeys, signEvent, verifyEvent, REPLAY_WINDOW_SECONDS } from '../src/webhooks.js';
 import { CHECKSUM_VERSION, checksum, isUntampered, verifyReceipt } from '../src/receipts.js';
-import { decryptRecord, encryptRecord, vaultKey } from '../src/vault.js';
+import { RECORD_VERSION, decryptRecord, encryptRecord, vaultKey } from '../src/vault.js';
+import { scryptSync } from 'node:crypto';
 import { tlsOptions } from '../src/tls.js';
 
 test('card envelope round-trips', () => {
@@ -554,4 +555,53 @@ test('F3: a P-256-only client is refused', async () => {
 test('F3: a TLS 1.2 client is refused', async () => {
   const r = await handshake({ maxVersion: 'TLSv1.2' });
   assert.equal(r.ok, false);
+});
+
+test('F6: customer records are sealed as v2 with AES-256-GCM and a 32-byte key', () => {
+  const key = vaultKey('service-secret');
+  assert.equal(key.length, 32);
+  const sealed = encryptRecord({ name: 'Meera Iyer' }, key);
+  const parts = sealed.split('.');
+  assert.equal(RECORD_VERSION, 'v2');
+  assert.equal(parts[0], 'v2');
+  assert.equal(parts.length, 4);
+  assert.equal(Buffer.from(parts[1], 'base64').length, 12);
+  assert.equal(Buffer.from(parts[2], 'base64').length, 16);
+});
+
+test('F6: each v2 record gets a fresh IV', () => {
+  const key = vaultKey('service-secret');
+  const a = encryptRecord({ name: 'Meera Iyer' }, key).split('.');
+  const b = encryptRecord({ name: 'Meera Iyer' }, key).split('.');
+  assert.notEqual(a[1], b[1]);
+  assert.notEqual(a[3], b[3]);
+});
+
+test('F6: v2 record rejects a wrong key, a tampered ciphertext and a swapped tag', () => {
+  const key = vaultKey('service-secret');
+  const sealed = encryptRecord({ name: 'Meera Iyer', city: 'Pune' }, key);
+  assert.throws(() => decryptRecord(sealed, vaultKey('other-secret')));
+  const parts = sealed.split('.');
+  const ct = Buffer.from(parts[3], 'base64');
+  ct[0] ^= 1;
+  assert.throws(() => decryptRecord([parts[0], parts[1], parts[2], ct.toString('base64')].join('.'), key));
+  const other = encryptRecord({ name: 'x' }, key).split('.');
+  assert.throws(() => decryptRecord([parts[0], parts[1], other[2], parts[3]].join('.'), key));
+});
+
+test('F6: legacy AES-128 records are refused with a clear error, not misread', () => {
+  // A record exactly as the pre-F6 vault.js wrote it.
+  const legacyKey = scryptSync('service-secret', 'demo-payments/customer-vault/v1', 16);
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-128-gcm', legacyKey, iv);
+  const ct = Buffer.concat([cipher.update(JSON.stringify({ name: 'Meera Iyer' }), 'utf8'), cipher.final()]);
+  const legacy = [iv, cipher.getAuthTag(), ct].map((b) => b.toString('base64')).join('.');
+  assert.throws(() => decryptRecord(legacy, vaultKey('service-secret')), /only v2 \(AES-256-GCM\) records/);
+});
+
+test('F6: a 16-byte (AES-128) key is rejected for both encrypt and decrypt', () => {
+  const shortKey = scryptSync('service-secret', 'demo-payments/customer-vault/v1', 16);
+  assert.throws(() => encryptRecord({ name: 'x' }, shortKey), /32 bytes/);
+  const sealed = encryptRecord({ name: 'x' }, vaultKey('service-secret'));
+  assert.throws(() => decryptRecord(sealed, shortKey), /32 bytes/);
 });
