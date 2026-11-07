@@ -1,8 +1,23 @@
 import { test } from 'node:test';
-import { sign as rawSign, verify as rawVerify } from 'node:crypto';
+import {
+  constants,
+  createCipheriv,
+  generateKeyPairSync,
+  publicEncrypt,
+  randomBytes,
+  sign as rawSign,
+  verify as rawVerify,
+} from 'node:crypto';
 import assert from 'node:assert/strict';
 
-import { generateVaultKeys, openCard, sealCard } from '../src/envelope.js';
+import {
+  ENVELOPE_ALG,
+  envelopeVersion,
+  generateVaultKeys,
+  openCard,
+  resealCard,
+  sealCard,
+} from '../src/envelope.js';
 import { createSessionParty, deriveSessionKey } from '../src/session.js';
 import { generateWebhookKeys, signEvent, verifyEvent, REPLAY_WINDOW_SECONDS } from '../src/webhooks.js';
 import { checksum, isUntampered } from '../src/receipts.js';
@@ -21,6 +36,105 @@ test('card envelope rejects a tampered ciphertext', () => {
   const bytes = Buffer.from(envelope.ciphertext, 'base64');
   bytes[0] ^= 1;
   assert.throws(() => openCard({ ...envelope, ciphertext: bytes.toString('base64') }, privateKey));
+});
+
+// The v1 sealer exactly as it shipped before F1, so the tests read real
+// legacy envelopes rather than ones made by the new code.
+function sealCardV1(cardNumber, rsaPublicKey) {
+  const dataKey = randomBytes(32);
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', dataKey, iv);
+  const ciphertext = Buffer.concat([cipher.update(cardNumber, 'utf8'), cipher.final()]);
+  const wrappedKey = publicEncrypt(
+    { key: rsaPublicKey, padding: constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha256' },
+    dataKey,
+  );
+  return {
+    wrappedKey: wrappedKey.toString('base64'),
+    iv: iv.toString('base64'),
+    tag: cipher.getAuthTag().toString('base64'),
+    ciphertext: ciphertext.toString('base64'),
+  };
+}
+
+function flipFirstByte(b64) {
+  const bytes = Buffer.from(b64, 'base64');
+  bytes[0] ^= 1;
+  return bytes.toString('base64');
+}
+
+test('new card envelopes are v2 hybrid X25519 + ML-KEM-768 with no RSA wrap', () => {
+  const { publicKey } = generateVaultKeys();
+  const envelope = sealCard('4111111111111111', publicKey);
+  assert.equal(envelope.v, 2);
+  assert.equal(envelope.alg, ENVELOPE_ALG);
+  assert.equal(envelope.wrappedKey, undefined);
+  assert.equal(Buffer.from(envelope.kemCiphertext, 'base64').length, 1088); // ML-KEM-768 ciphertext
+  assert.equal(Buffer.from(envelope.iv, 'base64').length, 12);
+});
+
+test('two envelopes for the same card share no IV, KEM ciphertext or ephemeral key', () => {
+  const { publicKey } = generateVaultKeys();
+  const a = sealCard('4111111111111111', publicKey);
+  const b = sealCard('4111111111111111', publicKey);
+  assert.notEqual(a.iv, b.iv);
+  assert.notEqual(a.kemCiphertext, b.kemCiphertext);
+  assert.notEqual(a.ephemeralKey, b.ephemeralKey);
+  assert.notEqual(a.ciphertext, b.ciphertext);
+});
+
+for (const field of ['kemCiphertext', 'ephemeralKey', 'iv', 'tag']) {
+  test(`card envelope rejects a tampered ${field}`, () => {
+    const { publicKey, privateKey } = generateVaultKeys();
+    const envelope = sealCard('4111111111111111', publicKey);
+    assert.throws(() => openCard({ ...envelope, [field]: flipFirstByte(envelope[field]) }, privateKey));
+  });
+}
+
+test('card envelope rejects a changed version or algorithm label', () => {
+  const { publicKey, privateKey } = generateVaultKeys();
+  const envelope = sealCard('4111111111111111', publicKey);
+  assert.throws(() => openCard({ ...envelope, v: 3 }, privateKey), /unsupported envelope version/);
+  assert.throws(() => openCard({ ...envelope, alg: 'RSA-OAEP' }, privateKey), /unsupported envelope algorithm/);
+});
+
+test('a v2 envelope does not open with another vault key', () => {
+  const vault = generateVaultKeys();
+  const other = generateVaultKeys();
+  const envelope = sealCard('4111111111111111', vault.publicKey);
+  assert.throws(() => openCard(envelope, other.privateKey));
+  // Either half alone being wrong is enough to fail.
+  assert.throws(() => openCard(envelope, { ...vault.privateKey, mlkem: other.privateKey.mlkem }));
+  assert.throws(() => openCard(envelope, { ...vault.privateKey, x25519: other.privateKey.x25519 }));
+});
+
+test('sealCard refuses a bare RSA public key', () => {
+  const rsa = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  assert.throws(() => sealCard('4111111111111111', rsa.publicKey), /X25519 and ML-KEM-768/);
+});
+
+test('legacy v1 RSA-OAEP envelopes still open', () => {
+  const rsa = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const vault = generateVaultKeys();
+  const legacy = sealCardV1('4111111111111111', rsa.publicKey);
+  assert.equal(envelopeVersion(legacy), 1);
+  assert.equal(openCard(legacy, { ...vault.privateKey, rsa: rsa.privateKey }), '4111111111111111');
+  assert.throws(() => openCard(legacy, vault.privateKey), /legacy RSA private key/);
+});
+
+test('legacy v1 envelope still rejects a tampered ciphertext', () => {
+  const rsa = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const legacy = sealCardV1('4111111111111111', rsa.publicKey);
+  assert.throws(() => openCard({ ...legacy, ciphertext: flipFirstByte(legacy.ciphertext) }, { rsa: rsa.privateKey }));
+});
+
+test('resealCard turns a v1 envelope into a v2 one that opens without RSA', () => {
+  const rsa = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const vault = generateVaultKeys();
+  const legacy = sealCardV1('5555555555554444', rsa.publicKey);
+  const resealed = resealCard(legacy, { ...vault.privateKey, rsa: rsa.privateKey }, vault.publicKey);
+  assert.equal(envelopeVersion(resealed), 2);
+  assert.equal(openCard(resealed, vault.privateKey), '5555555555554444');
 });
 
 test('both sides derive the same 32-byte session key', () => {
