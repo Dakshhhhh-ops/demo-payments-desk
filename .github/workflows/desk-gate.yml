@@ -18,11 +18,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: The gate's code and the desk's public keys (the desk branch, never a PR's code)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: desk
           path: desk
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
       - name: Read the repository as git objects (branches, PR heads and approval tags)
