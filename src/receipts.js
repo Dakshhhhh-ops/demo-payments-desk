@@ -6,15 +6,14 @@
 //   v2 (current): "v2." + hex HMAC-SHA-256 over a domain tag and the
 //       canonical receipt, keyed by a server secret. Without the key a
 //       customer cannot produce a matching checksum for an edited receipt.
-//   v1 (legacy, read only): bare 40-hex SHA-1 of the canonical receipt.
-//       Unkeyed and collision-prone. Accepted only so that receipts already
-//       issued still verify; results are flagged `legacy: true`. New
-//       checksums are never v1. Sunset: remove the v1 read path once the
-//       last v1 receipt is past the receipt retention period (date to be
-//       set by the receipts owner).
+//   v1 (retired): bare 40-hex SHA-1 of the canonical receipt. No longer
+//       verified at all: it is unkeyed and collision-prone. A v1 checksum is
+//       rejected without being hashed and flagged `legacy: true`, so support
+//       knows to re-issue the receipt as v2 from our own records with
+//       checksum() rather than trust the forwarded copy.
 //
 // Key: pass `key` explicitly, or set RECEIPT_CHECKSUM_KEY. At least 32 bytes.
-import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 
 export const CHECKSUM_VERSION = 'v2';
 const DOMAIN = 'demo-payments/receipt-checksum/v2\n';
@@ -48,10 +47,6 @@ function hmacHex(receipt, key) {
   return createHmac('sha256', key).update(DOMAIN).update(canonical(receipt)).digest('hex');
 }
 
-function legacySha1Hex(receipt) {
-  return createHash('sha1').update(canonical(receipt)).digest('hex');
-}
-
 function equalHex(a, b) {
   const x = Buffer.from(a, 'hex');
   const y = Buffer.from(b, 'hex');
@@ -62,17 +57,14 @@ export function checksum(receipt, key) {
   return `${CHECKSUM_VERSION}.${hmacHex(receipt, resolveKey(key))}`;
 }
 
-// Returns { ok, legacy }. `legacy` is true when a v1 SHA-1 checksum matched;
-// callers should treat that as weaker evidence and re-issue with checksum().
-export function verifyReceipt(receipt, expected, { key, acceptLegacy = true } = {}) {
+// Returns { ok, legacy }. `legacy` is true when `expected` has the retired v1
+// shape; it is never ok, and support should re-issue from records.
+export function verifyReceipt(receipt, expected, { key } = {}) {
   if (typeof expected !== 'string') return { ok: false, legacy: false };
   if (V2_PATTERN.test(expected)) {
     return { ok: equalHex(hmacHex(receipt, resolveKey(key)), expected.slice(3)), legacy: false };
   }
-  if (V1_PATTERN.test(expected)) {
-    if (!acceptLegacy) return { ok: false, legacy: true };
-    return { ok: equalHex(legacySha1Hex(receipt), expected), legacy: true };
-  }
+  if (V1_PATTERN.test(expected)) return { ok: false, legacy: true };
   return { ok: false, legacy: false };
 }
 
@@ -80,9 +72,3 @@ export function isUntampered(receipt, expected, options) {
   return verifyReceipt(receipt, expected, options).ok;
 }
 
-// Re-issue a verified legacy checksum as v2. Throws if the old one does not match.
-export function upgradeChecksum(receipt, expected, key) {
-  const result = verifyReceipt(receipt, expected, { key });
-  if (!result.ok) throw new Error('receipt does not match its checksum; refusing to upgrade');
-  return result.legacy ? checksum(receipt, key) : expected;
-}

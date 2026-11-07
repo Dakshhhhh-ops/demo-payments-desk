@@ -31,7 +31,7 @@ import {
   SESSION_VERSION,
 } from '../src/session.js';
 import { generateWebhookKeys, signEvent, verifyEvent, REPLAY_WINDOW_SECONDS } from '../src/webhooks.js';
-import { CHECKSUM_VERSION, checksum, isUntampered, upgradeChecksum, verifyReceipt } from '../src/receipts.js';
+import { CHECKSUM_VERSION, checksum, isUntampered, verifyReceipt } from '../src/receipts.js';
 import { decryptRecord, encryptRecord, vaultKey } from '../src/vault.js';
 import { tlsOptions } from '../src/tls.js';
 
@@ -298,6 +298,7 @@ const RECEIPT = { id: 'rcpt_2', amount: 12500, currency: 'INR', merchant: 'dosa-
 const RECEIPT_KEY = Buffer.alloc(32, 7);
 const OTHER_KEY = Buffer.alloc(32, 9);
 // Frozen v1 checksum: output of the pre-F4 SHA-1 checksum() on main for RECEIPT.
+// Kept as a literal so the tests never compute SHA-1.
 const LEGACY_SHA1 = '5e614ba5b2abc48f8cac46c2020a42181c51ff0f';
 
 test('new receipt checksums are v2 HMAC-SHA-256 and verify', () => {
@@ -345,28 +346,25 @@ test('receipt checksum refuses a missing or short key', () => {
   }
 });
 
-test('legacy SHA-1 receipt checksums still verify and are flagged', () => {
-  assert.deepEqual(verifyReceipt(RECEIPT, LEGACY_SHA1, { key: RECEIPT_KEY }), { ok: true, legacy: true });
-  assert.equal(isUntampered({ ...RECEIPT, amount: 1 }, LEGACY_SHA1, { key: RECEIPT_KEY }), false);
+test('F4: an old SHA-1 receipt checksum is rejected and flagged for re-issue', () => {
+  assert.deepEqual(verifyReceipt(RECEIPT, LEGACY_SHA1, { key: RECEIPT_KEY }), { ok: false, legacy: true });
+  assert.equal(isUntampered(RECEIPT, LEGACY_SHA1, { key: RECEIPT_KEY }), false);
 });
 
-test('legacy SHA-1 checksums verify without a key and can be switched off', () => {
+test('F4: an old SHA-1 receipt checksum is rejected even with no key configured', () => {
   const saved = process.env.RECEIPT_CHECKSUM_KEY;
   delete process.env.RECEIPT_CHECKSUM_KEY;
   try {
-    assert.equal(isUntampered(RECEIPT, LEGACY_SHA1), true);
+    assert.deepEqual(verifyReceipt(RECEIPT, LEGACY_SHA1), { ok: false, legacy: true });
   } finally {
     if (saved !== undefined) process.env.RECEIPT_CHECKSUM_KEY = saved;
   }
-  assert.deepEqual(verifyReceipt(RECEIPT, LEGACY_SHA1, { key: RECEIPT_KEY, acceptLegacy: false }), { ok: false, legacy: true });
 });
 
-test('a legacy receipt checksum upgrades to v2 only when it matches', () => {
-  const upgraded = upgradeChecksum(RECEIPT, LEGACY_SHA1, RECEIPT_KEY);
-  assert.match(upgraded, /^v2\./);
-  assert.deepEqual(verifyReceipt(RECEIPT, upgraded, { key: RECEIPT_KEY }), { ok: true, legacy: false });
-  assert.throws(() => upgradeChecksum({ ...RECEIPT, amount: 1 }, LEGACY_SHA1, RECEIPT_KEY), /refusing to upgrade/);
-  assert.equal(upgradeChecksum(RECEIPT, upgraded, RECEIPT_KEY), upgraded);
+test('F4: support re-issues an old receipt as v2 from records', () => {
+  const reissued = checksum(RECEIPT, RECEIPT_KEY);
+  assert.notEqual(reissued, LEGACY_SHA1);
+  assert.deepEqual(verifyReceipt(RECEIPT, reissued, { key: RECEIPT_KEY }), { ok: true, legacy: false });
 });
 
 test('customer record round-trips', () => {
